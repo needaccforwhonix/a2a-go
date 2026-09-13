@@ -1,11 +1,14 @@
 #!/bin/bash
 set -ex
 
+# Set default log level
+export ITK_LOG_LEVEL="${ITK_LOG_LEVEL:-INFO}"
+
 # Initialize default exit code
 RESULT=1
 
-# 1. Pull a2a-samples and checkout revision
-: "${A2A_SAMPLES_REVISION:?A2A_SAMPLES_REVISION environment variable must be set}"
+# 1. Pull a2a-itk and checkout revision
+: "${A2A_ITK_REVISION:?A2A_ITK_REVISION environment variable must be set}"
 
 # Cleanup function to be called on exit
 cleanup() {
@@ -14,7 +17,7 @@ cleanup() {
   docker stop itk-service > /dev/null 2>&1 || true
   docker rm itk-service > /dev/null 2>&1 || true
   docker rmi itk_service > /dev/null 2>&1 || true
-  rm -rf a2a-samples > /dev/null 2>&1 || true
+  rm -rf a2a-itk > /dev/null 2>&1 || true
   rm -rf pb > /dev/null 2>&1 || true
   rm -f instruction.proto > /dev/null 2>&1 || true
   echo "Done. Final exit code: $RESULT"
@@ -23,21 +26,21 @@ cleanup() {
 # Register cleanup function to run on script exit
 trap cleanup EXIT
 
-if [ ! -d "a2a-samples" ]; then
-  git clone https://github.com/a2aproject/a2a-samples.git a2a-samples
+if [ ! -d "a2a-itk" ]; then
+  git clone https://github.com/a2aproject/a2a-itk.git a2a-itk
 fi
-cd a2a-samples
+cd a2a-itk
 git fetch origin
-git checkout "$A2A_SAMPLES_REVISION"
+git checkout "$A2A_ITK_REVISION"
 
 # Only pull if it's a branch (not a detached HEAD)
 if git symbolic-ref -q HEAD > /dev/null; then
-  git pull origin "$A2A_SAMPLES_REVISION"
+  git pull origin "$A2A_ITK_REVISION"
 fi
 cd ..
 
-# 2. Copy instruction.proto from a2a-samples
-cp a2a-samples/itk/protos/instruction.proto ./instruction.proto
+# 2. Copy instruction.proto from a2a-itk
+cp a2a-itk/protos/instruction.proto ./instruction.proto
 
 # 3. Build go pb library
 # Ensure protoc-gen-go and protoc-gen-go-grpc are installed
@@ -52,12 +55,16 @@ protoc -I. \
     --go-grpc_out=pb --go-grpc_opt=Minstruction.proto=github.com/a2aproject/a2a-go/itk/pb --go-grpc_opt=paths=source_relative \
     instruction.proto
 
-# 4. Synchronize go.mod
-# We need to run go mod tidy because we might have added new dependencies or changed imports
-go mod tidy
+# 4. Verify go.mod/go.sum still match the sources (including the generated pb
+# package). go.sum is committed so the agent builds reproducibly; unlike
+# `go mod tidy`, `-diff` fails instead of silently rewriting the lock file.
+go mod tidy -diff
 
-# 5. Build jit itk_service docker image from root of a2a-samples/itk
-docker build -t itk_service a2a-samples/itk
+# 5. Build jit itk_service docker image from root of a2a-itk (skipped in CI
+# where the workflow builds via docker/build-push-action for GHA caching).
+if [ "${ITK_SKIP_BUILD:-0}" != "1" ]; then
+  docker build -t itk_service a2a-itk
+fi
 
 # 6. Start docker service
 A2A_GO_ROOT=$(cd .. && pwd)
@@ -66,13 +73,31 @@ ITK_DIR=$(pwd)
 # Stop existing container if any
 docker rm -f itk-service || true
 
+# Create logs directory if debug
+if [ "${ITK_LOG_LEVEL^^}" = "DEBUG" ]; then
+  mkdir -p "$ITK_DIR/logs"
+fi
+
+DOCKER_MOUNT_LOGS=""
+if [ "${ITK_LOG_LEVEL^^}" = "DEBUG" ]; then
+  DOCKER_MOUNT_LOGS="-v $ITK_DIR/logs:/app/logs"
+fi
+
+mkdir -p "$HOME/.cache/a2a-itk-launcher"
+
 # Run container with protobuf registration conflict set to 'warn'
 # This is necessary because the SDK v2 depends on its predecessor v0.x,
 # causing global proto registration conflicts.
 docker run -d --name itk-service \
   -e GOLANG_PROTOBUF_REGISTRATION_CONFLICT=warn \
+  -e ITK_LOG_LEVEL="$ITK_LOG_LEVEL" \
+  -e ITK_ENTRYPOINT="${ITK_ENTRYPOINT:-itk_service_v2.py}" \
+  -e ITK_READINESS_TIMEOUT="${ITK_READINESS_TIMEOUT:-180}" \
+  -e ITK_MAX_WORKERS="${ITK_MAX_WORKERS:-2}" \
   -v "$A2A_GO_ROOT:/app/agents/repo" \
   -v "$ITK_DIR:/app/agents/repo/itk" \
+  -v "$HOME/.cache/a2a-itk-launcher:/root/.cache/a2a-itk" \
+  $DOCKER_MOUNT_LOGS \
   -p 8000:8000 \
   itk_service
 
@@ -80,6 +105,9 @@ docker run -d --name itk-service \
 docker exec itk-service git config --system --add safe.directory /app/agents/repo
 docker exec itk-service git config --system --add safe.directory /app/agents/repo/itk
 docker exec itk-service git config --system core.multiPackIndex false
+# Launcher's peer checkouts under /root/.cache/a2a-itk are host-owned; trust
+# only repos under the launcher cache dir so container-side git accepts them.
+docker exec itk-service bash -lc 'while IFS= read -r -d "" d; do git config --system --add safe.directory "${d%/.git}"; done < <(find /root/.cache/a2a-itk -type d -name .git -print0)'
 
 # 7. Verify service is up and send post request
 MAX_RETRIES=30
@@ -101,48 +129,28 @@ if ! curl -s http://127.0.0.1:8000/ > /dev/null; then
   exit 1
 fi
 
-echo "ITK Service is up! Sending compatibility test request..."
+SCENARIO_FILE="scenarios.json"
+if [ "${ITK_NIGHTLY_RUN^^}" = "TRUE" ]; then
+  SCENARIO_FILE="scenarios_full.json"
+fi
+
+echo "ITK Service is up! Sending compatibility test request using $SCENARIO_FILE..."
 RESPONSE=$(curl -s -X POST http://127.0.0.1:8000/run \
   -H "Content-Type: application/json" \
-  -d '{
-    "tests": [
-      {
-        "name": "Star Topology (Full) - JSONRPC",
-        "sdks": ["current", "python_v10", "python_v03", "go_v10", "go_v03"],
-        "traversal": "euler",
-        "edges": ["0->1", "0->2", "0->3", "0->4", "1->0", "2->0", "3->0", "4->0"],
-        "protocols": ["jsonrpc"]
-      },
-      {
-        "name": "Star Topology (No Backwards Compatibility) - GRPC & HTTP_JSON",
-        "sdks": ["current", "python_v10", "go_v10"],
-        "traversal": "euler",
-        "edges": ["0->1", "0->2", "1->0", "2->0"],
-        "protocols": ["grpc", "http_json"]
-      },
-      {
-        "name": "Star Topology (Full) - JSONRPC (Streaming)",
-        "sdks": ["current", "python_v10", "python_v03", "go_v10", "go_v03"],
-        "traversal": "euler",
-        "edges": ["0->1", "0->2", "0->3", "0->4", "1->0", "2->0", "3->0", "4->0"],
-        "protocols": ["jsonrpc"],
-        "streaming": true
-      },
-      {
-        "name": "Star Topology (No Backwards Compatibility) - GRPC & HTTP_JSON (Streaming)",
-        "sdks": ["current", "python_v10", "go_v10"],
-        "traversal": "euler",
-        "edges": ["0->1", "0->2", "1->0", "2->0"],
-        "protocols": ["grpc", "http_json"],
-        "streaming": true
-      }
-    ]
-  }')
+  -d "@$SCENARIO_FILE")
 
-echo "--------------------------------------------------------"
-echo "ITK TEST RESULTS:"
-echo "--------------------------------------------------------"
-echo "$RESPONSE" | python3 -c "
+if [ "${ITK_NIGHTLY_RUN^^}" = "TRUE" ]; then
+  echo "Nightly run detected. Saving raw results and running process_results.py..."
+  echo "$RESPONSE" > raw_results.json
+  python3 a2a-itk/scripts/process_results.py \
+    --history_output_file itk_go.json \
+    --history_url https://github.com/a2aproject/a2a-go/releases/download/nightly-metrics/itk_go.json
+  RESULT=$?
+else
+  echo "--------------------------------------------------------"
+  echo "ITK TEST RESULTS:"
+  echo "--------------------------------------------------------"
+  echo "$RESPONSE" | python3 -c "
 import sys, json
 try:
     data = json.load(sys.stdin)
@@ -160,7 +168,8 @@ except Exception as e:
     print(f'Raw response: {data if \"data\" in locals() else \"no data\"}')
     sys.exit(1)
 "
-RESULT=$?
+  RESULT=$?
+fi
 set -e
 
 if [ $RESULT -ne 0 ]; then

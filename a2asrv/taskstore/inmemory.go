@@ -122,6 +122,11 @@ func (s *InMemory) Update(ctx context.Context, req *UpdateRequest) (TaskVersion,
 		return TaskVersionMissing, err
 	}
 
+	userName, err := s.config.Authenticator(ctx)
+	if err != nil {
+		return TaskVersionMissing, fmt.Errorf("taskstore auth failed: %w", err)
+	}
+
 	copy, err := utils.DeepCopy(req.Task)
 	if err != nil {
 		return TaskVersionMissing, err
@@ -132,6 +137,10 @@ func (s *InMemory) Update(ctx context.Context, req *UpdateRequest) (TaskVersion,
 
 	stored := s.tasks[req.Task.ID]
 	if stored == nil {
+		return TaskVersionMissing, a2a.ErrTaskNotFound
+	}
+
+	if stored.user != userName {
 		return TaskVersionMissing, a2a.ErrTaskNotFound
 	}
 
@@ -159,12 +168,21 @@ func (s *InMemory) Get(ctx context.Context, taskID a2a.TaskID) (*StoredTask, err
 		return nil, a2a.ErrTaskNotFound
 	}
 
+	// Mask ownership mismatch as ErrTaskNotFound per A2A spec §3.3.2
+	userName, err := s.config.Authenticator(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("taskstore auth failed: %w", err)
+	}
+	if storedTask.user != userName {
+		return nil, a2a.ErrTaskNotFound
+	}
+
 	task, err := utils.DeepCopy(storedTask.task)
 	if err != nil {
 		return nil, fmt.Errorf("task copy failed: %w", err)
 	}
 
-	return &StoredTask{Task: task, Version: storedTask.version}, nil
+	return &StoredTask{Task: task, Version: storedTask.version, User: storedTask.user}, nil
 }
 
 // List implements [Store] interface.
@@ -285,9 +303,9 @@ func toListTasksResult(tasks []*storedTask, req *a2a.ListTasksRequest) ([]*a2a.T
 		if req.HistoryLength != nil {
 			historyLength = *req.HistoryLength
 		}
-		if historyLength == 0 {
+		if historyLength <= 0 {
 			taskCopy.History = []*a2a.Message{}
-		} else if historyLength > 0 && len(taskCopy.History) > historyLength {
+		} else if len(taskCopy.History) > historyLength {
 			taskCopy.History = taskCopy.History[len(taskCopy.History)-historyLength:]
 		}
 		if !req.IncludeArtifacts {
@@ -301,7 +319,7 @@ func toListTasksResult(tasks []*storedTask, req *a2a.ListTasksRequest) ([]*a2a.T
 
 func encodePageToken(updatedTime time.Time, taskID a2a.TaskID) string {
 	timeStrNano := updatedTime.Format(time.RFC3339Nano)
-	return base64.URLEncoding.EncodeToString([]byte(fmt.Sprintf("%s_%s", timeStrNano, taskID)))
+	return base64.URLEncoding.EncodeToString(fmt.Appendf(nil, "%s_%s", timeStrNano, taskID))
 }
 
 func decodePageToken(nextPageToken string) (time.Time, a2a.TaskID, error) {

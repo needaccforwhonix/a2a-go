@@ -249,7 +249,7 @@ func TestInMemoryTaskStore_List_StoredImmutability(t *testing.T) {
 
 func createPageToken(updatedTime time.Time, taskID a2a.TaskID) string {
 	timeStrNano := updatedTime.Format(time.RFC3339Nano)
-	return base64.URLEncoding.EncodeToString([]byte(fmt.Sprintf("%s_%s", timeStrNano, taskID)))
+	return base64.URLEncoding.EncodeToString(fmt.Appendf(nil, "%s_%s", timeStrNano, taskID))
 }
 
 func TestInMemoryTaskStore_List_WithFilters(t *testing.T) {
@@ -305,7 +305,7 @@ func TestInMemoryTaskStore_List_WithFilters(t *testing.T) {
 			name:         "with negative HistoryLength filter",
 			givenTasks:   []*a2a.Task{{ID: id1, History: []*a2a.Message{{ID: "messageId1"}, {ID: "messageId2"}, {ID: "messageId3"}}}, {ID: id2, History: []*a2a.Message{{ID: "messageId4"}, {ID: "messageId5"}}}},
 			request:      &a2a.ListTasksRequest{HistoryLength: utils.Ptr(-1)},
-			wantResponse: &a2a.ListTasksResponse{Tasks: []*a2a.Task{{ID: id2, History: []*a2a.Message{{ID: "messageId4"}, {ID: "messageId5"}}}, {ID: id1, History: []*a2a.Message{{ID: "messageId1"}, {ID: "messageId2"}, {ID: "messageId3"}}}}},
+			wantResponse: &a2a.ListTasksResponse{Tasks: []*a2a.Task{{ID: id2, History: []*a2a.Message{}}, {ID: id1, History: []*a2a.Message{}}}},
 		},
 		{
 			name:         "PageSize filter",
@@ -356,14 +356,14 @@ func TestInMemoryTaskStore_List_WithFilters(t *testing.T) {
 					t.Fatalf("Expected error but got nil")
 				}
 				if diff := cmp.Diff(err.Error(), tc.wantErr.Error()); diff != "" {
-					t.Fatalf("Error mismatch (+got -want):\n%s", diff)
+					t.Fatalf("Error mismatch (-want +got):\n%s", diff)
 				}
 			} else {
 				if err != nil {
 					t.Fatalf("Unexpected error: got = %v, want nil", err)
 				}
 				if diff := cmp.Diff(listResponse.Tasks, tc.wantResponse.Tasks); diff != "" {
-					t.Fatalf("Tasks mismatch (+got -want):\n%s", diff)
+					t.Fatalf("Tasks mismatch (-want +got):\n%s", diff)
 				}
 			}
 		})
@@ -443,7 +443,7 @@ func TestInMemoryTaskStore_List_Pagination(t *testing.T) {
 				}
 			}
 			if diff := cmp.Diff(result, tc.result); diff != "" {
-				t.Fatalf("Tasks mismatch (+got -want):\n%s", diff)
+				t.Fatalf("Tasks mismatch (-want +got):\n%s", diff)
 			}
 			if actualCalls != tc.wantCalls {
 				t.Fatalf("Unexpected number of calls: got = %v, want %v", actualCalls, tc.wantCalls)
@@ -506,5 +506,75 @@ func TestInMemoryTaskStore_ConcurrentTaskModification(t *testing.T) {
 	task.ContextID = "id3"
 	if _, err := store.Update(t.Context(), &UpdateRequest{Task: task, PrevVersion: v1}); err == nil {
 		t.Fatal("Save() succeeded, wanted concurrent modification error")
+	}
+}
+
+type ctxKey string
+
+const userKey ctxKey = "user"
+
+func TestInMemoryTaskStore_CrossTenantIsolation(t *testing.T) {
+	ctx := t.Context()
+
+	// Create store with authenticator that identifies callers.
+	store := NewInMemory(&InMemoryStoreConfig{
+		Authenticator: func(ctx context.Context) (string, error) {
+			user, _ := ctx.Value(userKey).(string)
+			return user, nil
+		},
+	})
+
+	// Alice creates a task.
+	aliceCtx := context.WithValue(ctx, userKey, "alice")
+	aliceTask := &a2a.Task{
+		ID:     a2a.NewTaskID(),
+		Status: a2a.TaskStatus{State: a2a.TaskStateSubmitted},
+	}
+	_, err := store.Create(aliceCtx, aliceTask)
+	if err != nil {
+		t.Fatalf("alice Create failed: %v", err)
+	}
+
+	// Bob attempts to read Alice's task — must return ErrTaskNotFound.
+	bobCtx := context.WithValue(ctx, userKey, "bob")
+	_, err = store.Get(bobCtx, aliceTask.ID)
+	if !errors.Is(err, a2a.ErrTaskNotFound) {
+		t.Fatalf("bob Get: want ErrTaskNotFound, got %v", err)
+	}
+
+	// Bob creates his own task, then verifies List returns his task
+	// while correctly excluding Alice's.
+	bobTask := &a2a.Task{
+		ID:     a2a.NewTaskID(),
+		Status: a2a.TaskStatus{State: a2a.TaskStateSubmitted},
+	}
+	if _, err := store.Create(bobCtx, bobTask); err != nil {
+		t.Fatalf("bob Create failed: %v", err)
+	}
+
+	resp, err := store.List(bobCtx, &a2a.ListTasksRequest{})
+	if err != nil {
+		t.Fatalf("bob List failed: %v", err)
+	}
+	foundBob := false
+	for _, listed := range resp.Tasks {
+		if listed.ID == aliceTask.ID {
+			t.Fatal("bob List should not include alice's task")
+		}
+		if listed.ID == bobTask.ID {
+			foundBob = true
+		}
+	}
+	if !foundBob {
+		t.Fatal("bob List should include bob's own task")
+	}
+
+	// Alice can still Get her own task.
+	stored, err := store.Get(aliceCtx, aliceTask.ID)
+	if err != nil {
+		t.Fatalf("alice Get failed: %v", err)
+	}
+	if stored.Task.ID != aliceTask.ID {
+		t.Fatalf("alice task ID mismatch")
 	}
 }

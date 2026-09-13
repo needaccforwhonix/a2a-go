@@ -16,6 +16,7 @@
 
 ### Test Writing
 
+* Do not leave comments in tests unless they explain a non-trivial implementation detail. Test name and test case setup should be self-explanatory.
 * ALWAYS use existing test files as a reference when generating new tests. Prioritize files in the same package if they exist.
 * Write "table-driven tests" when logic can be shared across multiple test cases.
 * Prioritize testing observable behavior of exported methods, not the internal state.
@@ -24,7 +25,7 @@
 * Use `t.Parallel()` at the start of test cases.
 * Use `receiver.Operation() error = %v, want %v` as a template for printing test error check failures.
 * Use `receiver.Operation() = %v, want %v` as a template for printing test error check failures.
-* Use `receiver.Operation() wrong result (+got,-want) diff = %s` as a template for printing test errors received when using `cmp.Diff`.
+* Use `receiver.Operation() wrong result (-want +got) diff = %s` as a template for printing test errors received when using `cmp.Diff`.
 * Prefer using `t.Fatalf` over `t.Errorf` unless printing all the failed checks is justified or the method is called not from the main goroutine. 
 
 ### AI learnings

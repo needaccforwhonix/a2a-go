@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"iter"
 	"log/slog"
+	"time"
 
 	"github.com/a2aproject/a2a-go/v2/a2a"
 	"github.com/a2aproject/a2a-go/v2/a2asrv/eventqueue"
@@ -29,6 +30,12 @@ import (
 	"github.com/a2aproject/a2a-go/v2/internal/taskexec"
 	"github.com/a2aproject/a2a-go/v2/log"
 )
+
+// ErrAgentInactivityTimeout is the cancellation cause set on an agent's
+// execution context when no events are written to the event pipe for the
+// duration configured via [WithAgentInactivityTimeout]. Callers can detect
+// this condition with errors.Is.
+var ErrAgentInactivityTimeout = taskexec.ErrAgentInactivityTimeout
 
 // RequestHandler defines a transport-agnostic interface for handling incoming A2A requests.
 type RequestHandler interface {
@@ -51,13 +58,13 @@ type RequestHandler interface {
 	SendStreamingMessage(context.Context, *a2a.SendMessageRequest) iter.Seq2[a2a.Event, error]
 
 	// GetTaskPushConfig handles the `GetTaskPushNotificationConfig` protocol method.
-	GetTaskPushConfig(context.Context, *a2a.GetTaskPushConfigRequest) (*a2a.TaskPushConfig, error)
+	GetTaskPushConfig(context.Context, *a2a.GetTaskPushConfigRequest) (*a2a.PushConfig, error)
 
 	// ListTaskPushConfigs handles the `ListTaskPushNotificationConfigs` protocol method.
-	ListTaskPushConfigs(context.Context, *a2a.ListTaskPushConfigRequest) ([]*a2a.TaskPushConfig, error)
+	ListTaskPushConfigs(context.Context, *a2a.ListTaskPushConfigRequest) (*a2a.ListTaskPushConfigResponse, error)
 
 	// CreateTaskPushConfig handles the `CreateTaskPushNotificationConfig` protocol method.
-	CreateTaskPushConfig(context.Context, *a2a.CreateTaskPushConfigRequest) (*a2a.TaskPushConfig, error)
+	CreateTaskPushConfig(context.Context, *a2a.PushConfig) (*a2a.PushConfig, error)
 
 	// DeleteTaskPushConfig handles the `DeleteTaskPushNotificationConfig` protocol method.
 	DeleteTaskPushConfig(context.Context, *a2a.DeleteTaskPushConfigRequest) error
@@ -79,7 +86,10 @@ type defaultRequestHandler struct {
 	pushConfigStore        push.ConfigStore
 	taskStore              taskstore.Store
 	workQueue              workqueue.Queue
+	ctxCodec               ContextCodec
 	reqContextInterceptors []ExecutorContextInterceptor
+
+	agentInactivityTimeout time.Duration
 
 	authenticatedCardProducer ExtendedAgentCardProducer
 	capabilities              *a2a.AgentCapabilities
@@ -122,6 +132,22 @@ func WithExecutionPanicHandler(handler func(r any) error) RequestHandlerOption {
 	}
 }
 
+// WithAgentInactivityTimeout configures the maximum time the server will wait
+// for the next event from an agent's producer before terminating its execution.
+// The timer is reset whenever the agent writes an event to the event pipe.
+// When the timeout fires the producer and consumer contexts are canceled with
+// [ErrAgentInactivityTimeout] as the cause, and the task is finalized via the
+// existing failure path.
+//
+// A value of 0 (default) or negative disables the inactivity watcher and
+// preserves prior behavior. The timeout applies in both single-process and
+// cluster modes.
+func WithAgentInactivityTimeout(d time.Duration) RequestHandlerOption {
+	return func(ih *InterceptedHandler, h *defaultRequestHandler) {
+		h.agentInactivityTimeout = d
+	}
+}
+
 // WithConcurrencyConfig allows to set limits on the number of concurrent executions.
 func WithConcurrencyConfig(config limiter.ConcurrencyConfig) RequestHandlerOption {
 	return func(ih *InterceptedHandler, h *defaultRequestHandler) {
@@ -146,11 +172,15 @@ func WithTaskStore(store taskstore.Store) RequestHandlerOption {
 	}
 }
 
+// ContextCodec is used for propagating context values through [workqueue.Queue].
+type ContextCodec = taskexec.ContextCodec
+
 // ClusterConfig groups the necessary dependencies for A2A cluster mode operation.
 type ClusterConfig struct {
 	QueueManager eventqueue.Manager
 	WorkQueue    workqueue.Queue
 	TaskStore    taskstore.Store
+	ContextCodec ContextCodec
 }
 
 // WithClusterMode is an experimental feature where work queue is used to distribute tasks across multiple instances.
@@ -159,6 +189,7 @@ func WithClusterMode(config ClusterConfig) RequestHandlerOption {
 		h.workQueue = config.WorkQueue
 		h.taskStore = config.TaskStore
 		h.queueManager = config.QueueManager
+		h.ctxCodec = config.ContextCodec
 	}
 }
 
@@ -177,18 +208,23 @@ func NewHandler(executor AgentExecutor, options ...RequestHandlerOption) Request
 		pushSender:      h.pushSender,
 		pushConfigStore: h.pushConfigStore,
 		interceptors:    h.reqContextInterceptors,
+		// TODO(yarolegovich): there should be a flag to specify whether workqueue implementation supports
+		// retries or not to be able to opt-out of extra GetTask RPC
+		taskRetrySupported: h.workQueue != nil,
 	}
 	if h.workQueue != nil {
 		if h.taskStore == nil || h.queueManager == nil {
 			panic("TaskStore and QueueManager must be provided for cluster mode")
 		}
 		h.execManager = taskexec.NewDistributedManager(taskexec.DistributedManagerConfig{
-			WorkQueue:         h.workQueue,
-			TaskStore:         h.taskStore,
-			QueueManager:      h.queueManager,
-			ConcurrencyConfig: h.concurrencyConfig,
-			Factory:           execFactory,
-			PanicHandler:      h.panicHandler,
+			WorkQueue:              h.workQueue,
+			TaskStore:              h.taskStore,
+			QueueManager:           h.queueManager,
+			ConcurrencyConfig:      h.concurrencyConfig,
+			Factory:                execFactory,
+			ContextCodec:           &callCtxCodec{AttrCodec: h.ctxCodec},
+			PanicHandler:           h.panicHandler,
+			AgentInactivityTimeout: h.agentInactivityTimeout,
 		})
 	} else {
 		if h.queueManager == nil {
@@ -201,11 +237,12 @@ func NewHandler(executor AgentExecutor, options ...RequestHandlerOption) Request
 			execFactory.taskStore = h.taskStore
 		}
 		h.execManager = taskexec.NewLocalManager(taskexec.LocalManagerConfig{
-			QueueManager:      h.queueManager,
-			ConcurrencyConfig: h.concurrencyConfig,
-			Factory:           execFactory,
-			TaskStore:         h.taskStore,
-			PanicHandler:      h.panicHandler,
+			QueueManager:           h.queueManager,
+			ConcurrencyConfig:      h.concurrencyConfig,
+			Factory:                execFactory,
+			TaskStore:              h.taskStore,
+			PanicHandler:           h.panicHandler,
+			AgentInactivityTimeout: h.agentInactivityTimeout,
 		})
 	}
 
@@ -228,9 +265,9 @@ func (h *defaultRequestHandler) GetTask(ctx context.Context, req *a2a.GetTaskReq
 	if req.HistoryLength != nil {
 		historyLength := *req.HistoryLength
 
-		if historyLength == 0 {
+		if historyLength <= 0 {
 			task.History = []*a2a.Message{}
-		} else if historyLength > 0 && historyLength < len(task.History) {
+		} else if historyLength < len(task.History) {
 			task.History = task.History[len(task.History)-historyLength:]
 		}
 	}
@@ -362,60 +399,70 @@ func (h *defaultRequestHandler) handleSendMessage(ctx context.Context, req *a2a.
 }
 
 // GetTaskPushConfig implements RequestHandler.
-func (h *defaultRequestHandler) GetTaskPushConfig(ctx context.Context, req *a2a.GetTaskPushConfigRequest) (*a2a.TaskPushConfig, error) {
+func (h *defaultRequestHandler) GetTaskPushConfig(ctx context.Context, req *a2a.GetTaskPushConfigRequest) (*a2a.PushConfig, error) {
 	if err := checkPushNotificationSupport(h, ctx); err != nil {
 		return nil, err
+	}
+	// Authorize: only the task owner can read its push configs.
+	if _, err := h.taskStore.Get(ctx, req.TaskID); err != nil {
+		return nil, fmt.Errorf("failed to get push config: %w", err)
 	}
 	config, err := h.pushConfigStore.Get(ctx, req.TaskID, req.ID)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get push configs: %w", err)
+		return nil, fmt.Errorf("failed to get push config: %w", err)
 	}
-	if config != nil {
-		return &a2a.TaskPushConfig{
-			TaskID: req.TaskID,
-			Config: *config,
-		}, nil
+	if config == nil {
+		return nil, push.ErrPushConfigNotFound
 	}
-	return nil, push.ErrPushConfigNotFound
+	return config, nil
 }
 
 // ListTaskPushConfigs implements RequestHandler.
-func (h *defaultRequestHandler) ListTaskPushConfigs(ctx context.Context, req *a2a.ListTaskPushConfigRequest) ([]*a2a.TaskPushConfig, error) {
+func (h *defaultRequestHandler) ListTaskPushConfigs(ctx context.Context, req *a2a.ListTaskPushConfigRequest) (*a2a.ListTaskPushConfigResponse, error) {
 	if err := checkPushNotificationSupport(h, ctx); err != nil {
 		return nil, err
+	}
+	// Authorize: only the task owner can list its push configs.
+	if _, err := h.taskStore.Get(ctx, req.TaskID); err != nil {
+		return nil, fmt.Errorf("failed to list push configs: %w", err)
 	}
 	configs, err := h.pushConfigStore.List(ctx, req.TaskID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list push configs: %w", err)
 	}
-	result := make([]*a2a.TaskPushConfig, len(configs))
-	for i, config := range configs {
-		result[i] = &a2a.TaskPushConfig{
-			TaskID: req.TaskID,
-			Config: *config,
-		}
+	if configs == nil {
+		return &a2a.ListTaskPushConfigResponse{Configs: []*a2a.PushConfig{}}, nil
 	}
-	return result, nil
+	return &a2a.ListTaskPushConfigResponse{Configs: configs}, nil
 }
 
 // CreateTaskPushConfig implements RequestHandler.
-func (h *defaultRequestHandler) CreateTaskPushConfig(ctx context.Context, req *a2a.CreateTaskPushConfigRequest) (*a2a.TaskPushConfig, error) {
+func (h *defaultRequestHandler) CreateTaskPushConfig(ctx context.Context, req *a2a.PushConfig) (*a2a.PushConfig, error) {
 	if err := checkPushNotificationSupport(h, ctx); err != nil {
 		return nil, err
 	}
 
-	saved, err := h.pushConfigStore.Save(ctx, req.TaskID, &req.Config)
-	if err != nil {
-		return nil, fmt.Errorf("failed to save push config: %w", err)
+	// Authorize: only the task owner can create push configs for it.
+	if _, err := h.taskStore.Get(ctx, req.TaskID); err != nil {
+		return nil, fmt.Errorf("failed to create push config: %w", err)
 	}
 
-	return &a2a.TaskPushConfig{TaskID: req.TaskID, Config: *saved}, nil
+	saved, err := h.pushConfigStore.Save(ctx, req.TaskID, req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create push config: %w", err)
+	}
+
+	return saved, nil
 }
 
 // DeleteTaskPushConfig implements RequestHandler.
 func (h *defaultRequestHandler) DeleteTaskPushConfig(ctx context.Context, req *a2a.DeleteTaskPushConfigRequest) error {
 	if err := checkPushNotificationSupport(h, ctx); err != nil {
 		return err
+	}
+	// Authorize: only the task owner can delete its push configs.
+	if _, err := h.taskStore.Get(ctx, req.TaskID); err != nil {
+		return fmt.Errorf("failed to delete push config: %w", err)
 	}
 	return h.pushConfigStore.Delete(ctx, req.TaskID, req.ID)
 }
@@ -453,16 +500,16 @@ func shouldInterruptNonStreaming(req *a2a.SendMessageRequest, event a2a.Event) (
 }
 
 func checkPushNotificationSupport(h *defaultRequestHandler, ctx context.Context) error {
-	// With capability checks, PushNootifications not supported
+	// With capability checks, PushNotifications not supported
 	if h.capabilities != nil && !h.capabilities.PushNotifications {
 		return a2a.ErrPushNotificationNotSupported
 	}
-	// With capability checks, PushNootifications supported, but not configured
+	// With capability checks, PushNotifications supported, but not configured
 	if h.capabilities != nil && (h.pushConfigStore == nil || h.pushSender == nil) {
 		log.Error(ctx, "push notifications are enabled but push config store or sender is not configured", a2a.ErrInternalError)
 		return a2a.ErrInternalError
 	}
-	// Without capability checks and PushNootifications are not configured
+	// Without capability checks and PushNotifications are not configured
 	if h.pushConfigStore == nil || h.pushSender == nil {
 		return a2a.ErrPushNotificationNotSupported
 	}

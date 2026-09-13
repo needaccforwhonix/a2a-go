@@ -15,6 +15,7 @@
 package pbconv
 
 import (
+	"encoding/base64"
 	"reflect"
 	"testing"
 	"time"
@@ -30,6 +31,7 @@ import (
 
 func TestFromProto_fromProtoPart(t *testing.T) {
 	pData, _ := structpb.NewStruct(map[string]any{"key": "value"})
+	base64Content := base64.StdEncoding.EncodeToString([]byte("content"))
 	tests := []struct {
 		name    string
 		p       *a2apb.Part
@@ -50,7 +52,7 @@ func TestFromProto_fromProtoPart(t *testing.T) {
 			name: "file with bytes",
 			p: &a2apb.Part{Part: &a2apb.Part_File{File: &a2apb.FilePart{
 				MimeType: "text/plain",
-				File:     &a2apb.FilePart_FileWithBytes{FileWithBytes: []byte("content")},
+				File:     &a2apb.FilePart_FileWithBytes{FileWithBytes: []byte(base64Content)},
 			}}},
 			want: a2a.Part{
 				Content:   a2a.Raw([]byte("content")),
@@ -103,7 +105,7 @@ func TestFromProto_fromProtoPart(t *testing.T) {
 			name: "file with meta",
 			p: &a2apb.Part{
 				Part: &a2apb.Part_File{File: &a2apb.FilePart{
-					File: &a2apb.FilePart_FileWithBytes{FileWithBytes: []byte("content")},
+					File: &a2apb.FilePart_FileWithBytes{FileWithBytes: []byte(base64Content)},
 				}},
 				Metadata: mustMakeProtoMetadata(t, map[string]any{"hello": "world"}),
 			},
@@ -232,7 +234,7 @@ func TestFromProto_fromProtoSendMessageConfig(t *testing.T) {
 				t.Fatalf("fromProtoSendMessageConfig() error = %v", err)
 			}
 			if diff := cmp.Diff(tt.want, got); diff != "" {
-				t.Errorf("fromProtoSendMessageConfig() wrong result (+got,-want)\ngot = %v\n want %v\ndiff = %s", got, tt.want, diff)
+				t.Errorf("fromProtoSendMessageConfig() wrong result (-want +got)\ngot = %v\n want %v\ndiff = %s", got, tt.want, diff)
 			}
 		})
 	}
@@ -509,7 +511,7 @@ func TestFromProto_fromProtoListTasksResponse(t *testing.T) {
 				return
 			}
 			if diff := cmp.Diff(got, tt.want); diff != "" {
-				t.Errorf("fromProtoListTasksResponse() mismatch (+got -want):\n%s", diff)
+				t.Errorf("fromProtoListTasksResponse() mismatch (-want +got):\n%s", diff)
 			}
 		})
 	}
@@ -519,7 +521,7 @@ func TestFromProto_fromProtoCreateTaskPushConfigRequest(t *testing.T) {
 	tests := []struct {
 		name    string
 		req     *a2apb.CreateTaskPushNotificationConfigRequest
-		want    *a2a.CreateTaskPushConfigRequest
+		want    *a2a.PushConfig
 		wantErr bool
 	}{
 		{
@@ -530,7 +532,7 @@ func TestFromProto_fromProtoCreateTaskPushConfigRequest(t *testing.T) {
 					PushNotificationConfig: &a2apb.PushNotificationConfig{Id: "test-config"},
 				},
 			},
-			want: &a2a.CreateTaskPushConfigRequest{TaskID: "test", Config: a2a.PushConfig{ID: "test-config"}},
+			want: &a2a.PushConfig{TaskID: "test", ID: "test-config"},
 		},
 		{
 			name: "nil config",
@@ -562,7 +564,7 @@ func TestFromProto_fromProtoCreateTaskPushConfigRequest(t *testing.T) {
 					PushNotificationConfig: &a2apb.PushNotificationConfig{Id: ""},
 				},
 			},
-			want: &a2a.CreateTaskPushConfigRequest{TaskID: "t1", Config: a2a.PushConfig{}},
+			want: &a2a.PushConfig{TaskID: "t1", ID: ""},
 		},
 	}
 	for _, tt := range tests {

@@ -159,21 +159,21 @@ func (h *InterceptedHandler) SubscribeToTask(ctx context.Context, req *a2a.Subsc
 }
 
 // GetTaskPushConfig implements RequestHandler.
-func (h *InterceptedHandler) GetTaskPushConfig(ctx context.Context, req *a2a.GetTaskPushConfigRequest) (*a2a.TaskPushConfig, error) {
+func (h *InterceptedHandler) GetTaskPushConfig(ctx context.Context, req *a2a.GetTaskPushConfigRequest) (*a2a.PushConfig, error) {
 	ctx, callCtx := attachMethodCallContext(ctx, "GetTaskPushConfig", req.Tenant)
 	ctx = h.withLoggerContext(ctx, slog.String("task_id", string(req.TaskID)))
 	return doCall(ctx, callCtx, h, req, h.Handler.GetTaskPushConfig)
 }
 
 // ListTaskPushConfigs implements RequestHandler.
-func (h *InterceptedHandler) ListTaskPushConfigs(ctx context.Context, req *a2a.ListTaskPushConfigRequest) ([]*a2a.TaskPushConfig, error) {
+func (h *InterceptedHandler) ListTaskPushConfigs(ctx context.Context, req *a2a.ListTaskPushConfigRequest) (*a2a.ListTaskPushConfigResponse, error) {
 	ctx, callCtx := attachMethodCallContext(ctx, "ListTaskPushConfigs", req.Tenant)
 	ctx = h.withLoggerContext(ctx, slog.String("task_id", string(req.TaskID)))
 	return doCall(ctx, callCtx, h, req, h.Handler.ListTaskPushConfigs)
 }
 
 // CreateTaskPushConfig implements RequestHandler.
-func (h *InterceptedHandler) CreateTaskPushConfig(ctx context.Context, req *a2a.CreateTaskPushConfigRequest) (*a2a.TaskPushConfig, error) {
+func (h *InterceptedHandler) CreateTaskPushConfig(ctx context.Context, req *a2a.PushConfig) (*a2a.PushConfig, error) {
 	ctx, callCtx := attachMethodCallContext(ctx, "CreateTaskPushConfig", req.Tenant)
 	ctx = h.withLoggerContext(ctx, slog.String("task_id", string(req.TaskID)))
 	return doCall(ctx, callCtx, h, req, h.Handler.CreateTaskPushConfig)
@@ -307,7 +307,7 @@ func attachMethodCallContext(ctx context.Context, method string, tenant string) 
 
 func doCall[Req any, Resp any](
 	ctx context.Context, callCtx *CallContext, h *InterceptedHandler, req Req,
-	transportCall func(context.Context, Req) (Resp, error),
+	handlerCall func(context.Context, Req) (Resp, error),
 ) (Resp, error) {
 	ctx, res := interceptBefore[Req, Resp](ctx, h, callCtx, req)
 	if res.earlyErr != nil {
@@ -321,7 +321,7 @@ func doCall[Req any, Resp any](
 		var zero Resp
 		return zero, err
 	}
-	response, err := transportCall(ctx, res.reqOverride)
+	response, err := handlerCall(ctx, res.reqOverride)
 	return interceptAfter(ctx, h.Interceptors, callCtx, response, err)
 }
 

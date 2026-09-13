@@ -172,17 +172,17 @@ func (c *Client) SubscribeToTask(ctx context.Context, req *a2a.SubscribeToTaskRe
 }
 
 // GetTaskPushConfig implements the `GetTaskPushNotificationConfig` protocol method.
-func (c *Client) GetTaskPushConfig(ctx context.Context, req *a2a.GetTaskPushConfigRequest) (*a2a.TaskPushConfig, error) {
+func (c *Client) GetTaskPushConfig(ctx context.Context, req *a2a.GetTaskPushConfigRequest) (*a2a.PushConfig, error) {
 	return doCall(ctx, c, "GetTaskPushConfig", req, c.transport.GetTaskPushConfig)
 }
 
 // ListTaskPushConfigs implements the `ListTaskPushNotificationConfig` protocol method.
-func (c *Client) ListTaskPushConfigs(ctx context.Context, req *a2a.ListTaskPushConfigRequest) ([]*a2a.TaskPushConfig, error) {
+func (c *Client) ListTaskPushConfigs(ctx context.Context, req *a2a.ListTaskPushConfigRequest) ([]*a2a.PushConfig, error) {
 	return doCall(ctx, c, "ListTaskPushConfigs", req, c.transport.ListTaskPushConfigs)
 }
 
 // CreateTaskPushConfig implements the `CreateTaskPushNotificationConfig` protocol method.
-func (c *Client) CreateTaskPushConfig(ctx context.Context, req *a2a.CreateTaskPushConfigRequest) (*a2a.TaskPushConfig, error) {
+func (c *Client) CreateTaskPushConfig(ctx context.Context, req *a2a.PushConfig) (*a2a.PushConfig, error) {
 	return doCall(ctx, c, "CreateTaskPushConfig", req, c.transport.CreateTaskPushConfig)
 }
 
@@ -227,6 +227,12 @@ func (c *Client) UpdateCard(card *a2a.AgentCard) error {
 	}
 	c.card.Store(card)
 	return nil
+}
+
+// Card returns the last AgentCard set on this client or nil if it was created from an [a2a.AgentInterface] handle
+// and was not updated using [Client.UpdateCard].
+func (c *Client) Card() *a2a.AgentCard {
+	return c.card.Load()
 }
 
 // Destroy cleans up resources associated with the client.

@@ -15,6 +15,7 @@
 package pbconv
 
 import (
+	"encoding/base64"
 	"fmt"
 	"time"
 
@@ -86,11 +87,41 @@ func FromProtoMessage(pMsg *a2apb.Message) (*a2a.Message, error) {
 	return msg, nil
 }
 
+// FromProtoCancelTaskRequest converts an [a2apb.CancelTaskRequest] to an [a2a.CancelTaskRequest].
+func FromProtoCancelTaskRequest(req *a2apb.CancelTaskRequest) (*a2a.CancelTaskRequest, error) {
+	if req == nil {
+		return nil, nil
+	}
+	taskID, err := ExtractTaskID(req.GetName())
+	if err != nil {
+		return nil, fmt.Errorf("failed to extract task id: %v", err)
+	}
+	return &a2a.CancelTaskRequest{ID: taskID}, nil
+}
+
+// FromProtoTaskSubscriptionRequest converts an [a2apb.TaskSubscriptionRequest] to an [a2a.SubscribeToTaskRequest].
+func FromProtoTaskSubscriptionRequest(req *a2apb.TaskSubscriptionRequest) (*a2a.SubscribeToTaskRequest, error) {
+	if req == nil {
+		return nil, nil
+	}
+	taskID, err := ExtractTaskID(req.GetName())
+	if err != nil {
+		return nil, fmt.Errorf("failed to extract task id: %v", err)
+	}
+	return &a2a.SubscribeToTaskRequest{ID: taskID}, nil
+}
+
 func fromProtoFilePart(pPart *a2apb.FilePart, meta map[string]any) (a2a.Part, error) {
 	switch f := pPart.GetFile().(type) {
 	case *a2apb.FilePart_FileWithBytes:
+		buf := make([]byte, base64.StdEncoding.DecodedLen(len(f.FileWithBytes)))
+		n, err := base64.StdEncoding.Decode(buf, []byte(f.FileWithBytes))
+		if err != nil {
+			return a2a.Part{}, fmt.Errorf("failed to decode base64 string: %w", err)
+		}
+		b := buf[:n]
 		return a2a.Part{
-			Content:   a2a.Raw(f.FileWithBytes),
+			Content:   a2a.Raw(b),
 			MediaType: pPart.GetMimeType(),
 			Filename:  pPart.GetName(),
 			Metadata:  meta,
@@ -260,7 +291,7 @@ func FromProtoListTasksResponse(resp *a2apb.ListTasksResponse) (*a2a.ListTasksRe
 }
 
 // FromProtoCreateTaskPushConfigRequest converts a [a2apb.CreateTaskPushNotificationConfigRequest] to a [a2a.CreateTaskPushConfigRequest].
-func FromProtoCreateTaskPushConfigRequest(req *a2apb.CreateTaskPushNotificationConfigRequest) (*a2a.CreateTaskPushConfigRequest, error) {
+func FromProtoCreateTaskPushConfigRequest(req *a2apb.CreateTaskPushNotificationConfigRequest) (*a2a.PushConfig, error) {
 	if req == nil {
 		return nil, nil
 	}
@@ -280,7 +311,7 @@ func FromProtoCreateTaskPushConfigRequest(req *a2apb.CreateTaskPushNotificationC
 		return nil, fmt.Errorf("failed to extract task id: %w", err)
 	}
 
-	return &a2a.CreateTaskPushConfigRequest{TaskID: taskID, Config: *pConf}, nil
+	return &a2a.PushConfig{TaskID: taskID, ID: pConf.ID, URL: pConf.URL, Token: pConf.Token, Auth: pConf.Auth}, nil
 }
 
 // FromProtoGetTaskPushConfigRequest converts a [a2apb.GetTaskPushNotificationConfigRequest] to a [a2a.GetTaskPushConfigRequest].
@@ -512,8 +543,8 @@ func FromProtoTask(pTask *a2apb.Task) (*a2a.Task, error) {
 	return result, nil
 }
 
-// FromProtoTaskPushConfig converts a [a2apb.TaskPushNotificationConfig] to a [a2a.TaskPushConfig].
-func FromProtoTaskPushConfig(pTaskConfig *a2apb.TaskPushNotificationConfig) (*a2a.TaskPushConfig, error) {
+// FromProtoTaskPushConfig converts a [a2apb.TaskPushNotificationConfig] to a [a2a.PushConfig].
+func FromProtoTaskPushConfig(pTaskConfig *a2apb.TaskPushNotificationConfig) (*a2a.PushConfig, error) {
 	if pTaskConfig == nil {
 		return nil, nil
 	}
@@ -542,7 +573,7 @@ func FromProtoTaskPushConfig(pTaskConfig *a2apb.TaskPushNotificationConfig) (*a2
 		return nil, fmt.Errorf("failed to convert push config: %w", err)
 	}
 
-	return &a2a.TaskPushConfig{TaskID: taskID, Config: *config}, nil
+	return &a2a.PushConfig{TaskID: taskID, ID: config.ID, URL: config.URL, Token: config.Token, Auth: config.Auth}, nil
 }
 
 // FromProtoListTaskPushConfigRequest converts a [a2apb.ListTaskPushNotificationConfigRequest] to a [a2a.ListTaskPushConfigRequest].
@@ -563,13 +594,18 @@ func FromProtoListTaskPushConfigRequest(req *a2apb.ListTaskPushNotificationConfi
 	}, nil
 }
 
+// FromProtoGetAgentCardRequest converts a [a2apb.GetAgentCardRequest] to a [a2a.GetExtendedAgentCardRequest].
+func FromProtoGetAgentCardRequest(req *a2apb.GetAgentCardRequest) *a2a.GetExtendedAgentCardRequest {
+	return &a2a.GetExtendedAgentCardRequest{}
+}
+
 // FromProtoListTaskPushConfigResponse converts a [a2apb.ListTaskPushNotificationConfigResponse] to a [a2a.ListTaskPushConfigResponse].
 func FromProtoListTaskPushConfigResponse(resp *a2apb.ListTaskPushNotificationConfigResponse) (*a2a.ListTaskPushConfigResponse, error) {
 	if resp == nil {
 		return nil, fmt.Errorf("response is nil")
 	}
 
-	configs := make([]*a2a.TaskPushConfig, len(resp.GetConfigs()))
+	configs := make([]*a2a.PushConfig, len(resp.GetConfigs()))
 	for i, pConfig := range resp.GetConfigs() {
 		config, err := FromProtoTaskPushConfig(pConfig)
 		if err != nil {

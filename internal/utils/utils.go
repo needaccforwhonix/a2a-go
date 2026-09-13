@@ -17,7 +17,12 @@ package utils
 
 import (
 	"bytes"
+	"context"
 	"encoding/gob"
+	"encoding/json"
+	"fmt"
+
+	"github.com/a2aproject/a2a-go/v2/log"
 )
 
 // Ptr returns a pointer to the argument simplifying pointer to primitive literals creation.
@@ -41,4 +46,58 @@ func DeepCopy[T any](task *T) (*T, error) {
 	}
 
 	return &copy, nil
+}
+
+// ToStringMap converts a map[string]any to a map[string]string.
+// It logs a warning if a value cannot be converted to a string.
+func ToStringMap(raw any) (map[string]string, bool) {
+	if m, ok := raw.(map[string]string); ok {
+		return m, true
+	} else if m, ok := raw.(map[string]any); ok {
+		converted := make(map[string]string)
+		for k, v := range m {
+			if s, ok := v.(string); ok {
+				converted[k] = s
+			} else {
+				log.Warn(context.Background(), "failed to convert metadata value to string", "key", k, "value", v)
+			}
+		}
+		return converted, true
+	}
+	return nil, false
+}
+
+// ToMapStruct converts an any struct to map[string]any using json roundtrip.
+func ToMapStruct(value any) (map[string]any, error) {
+	raw, err := json.Marshal(value)
+	if err != nil {
+		return nil, err
+	}
+	var r map[string]any
+	if err := json.Unmarshal(raw, &r); err != nil {
+		return nil, err
+	}
+	return r, nil
+}
+
+// FromMapStruct converts map[string]any to a typed value using json roundtrip.
+func FromMapStruct[T any](value map[string]any) (*T, error) {
+	raw, err := json.Marshal(value)
+	if err != nil {
+		return nil, err
+	}
+	var zero T
+	if err := json.Unmarshal(raw, &zero); err != nil {
+		return nil, err
+	}
+	return &zero, nil
+}
+
+// MustPrettyPrint is a debugging utility that prints indented JSON represenation of a value.
+func MustPrettyPrint(value any) {
+	raw, err := json.MarshalIndent(value, "", " ")
+	if err != nil {
+		panic(err.Error())
+	}
+	fmt.Println(string(raw))
 }

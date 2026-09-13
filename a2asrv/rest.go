@@ -50,9 +50,9 @@ func NewRESTHandler(handler RequestHandler, opts ...TransportOption) http.Handle
 	// TODO: handle tenant
 	mux.HandleFunc("POST "+rest.MakeSendMessagePath(), h.handleSendMessage)
 	mux.HandleFunc("POST "+rest.MakeStreamMessagePath(), h.handleStreamMessage)
-	mux.HandleFunc("GET "+rest.MakeGetTaskPath("{id}"), h.handleGetTask)
 	mux.HandleFunc("GET "+rest.MakeListTasksPath(), h.handleListTasks)
-	mux.HandleFunc("POST /tasks/{idAndAction}", h.handlePOSTTasks)
+	mux.HandleFunc("GET /tasks/{idAndAction}", h.handleGetOrSubscribeTask)
+	mux.HandleFunc("POST /tasks/{idAndAction}", h.handleCancelOrSubscribeTask)
 	mux.HandleFunc("POST "+rest.MakeCreatePushConfigPath("{id}"), h.handleCreateTaskPushConfig)
 	mux.HandleFunc("GET "+rest.MakeGetPushConfigPath("{id}", "{configId}"), h.handleGetTaskPushConfig)
 	mux.HandleFunc("GET "+rest.MakeListPushConfigsPath("{id}"), h.handleListTaskPushConfigs)
@@ -129,23 +129,19 @@ func (h *restHandler) handleStreamMessage(rw http.ResponseWriter, req *http.Requ
 	h.handleStreamingRequest(h.handler.SendStreamingMessage(ctx, &message), rw, req)
 }
 
-func (h *restHandler) handleGetTask(rw http.ResponseWriter, req *http.Request) {
+func (h *restHandler) handleGetTask(taskID string, rw http.ResponseWriter, req *http.Request) {
 	ctx := req.Context()
-	taskID := req.PathValue("id")
-	historyLengthRaw := req.URL.Query().Get("historyLength")
-	var historyLength *int
-	if historyLengthRaw != "" {
-		val, err := strconv.Atoi(historyLengthRaw)
-		if err != nil {
-			writeRESTError(ctx, rw, a2a.ErrInvalidRequest, a2a.TaskID(taskID))
-			return
-		}
-		historyLength = &val
-	}
 	if taskID == "" {
 		writeRESTError(ctx, rw, a2a.ErrInvalidRequest, a2a.TaskID(""))
 		return
 	}
+
+	historyLength, err := parseIntOpt(req.URL.Query(), "historyLength")
+	if err != nil {
+		writeRESTError(ctx, rw, a2a.ErrInvalidRequest, a2a.TaskID(taskID))
+		return
+	}
+
 	params := &a2a.GetTaskRequest{
 		ID:            a2a.TaskID(taskID),
 		HistoryLength: historyLength,
@@ -166,53 +162,42 @@ func (h *restHandler) handleGetTask(rw http.ResponseWriter, req *http.Request) {
 func (h *restHandler) handleListTasks(rw http.ResponseWriter, req *http.Request) {
 	ctx := req.Context()
 	query := req.URL.Query()
-	request := &a2a.ListTasksRequest{}
-	var parseErrors []error
-	parse := func(key string, target any) {
-		val := query.Get(key)
-		if val == "" {
-			return
-		}
-		switch t := target.(type) {
-		case *string:
-			*t = val
-		case *a2a.TaskState:
-			*t = a2a.TaskState(val)
-		case *int:
-			v, err := strconv.Atoi(val)
-			if err != nil {
-				parseErrors = append(parseErrors, fmt.Errorf("invalid %s: %w", key, err))
-				return
-			}
-			*t = v
-		case *bool:
-			v, err := strconv.ParseBool(val)
-			if err != nil {
-				parseErrors = append(parseErrors, fmt.Errorf("invalid %s: %w", key, err))
-				return
-			}
-			*t = v
-		case *time.Time:
-			parsedTime, err := time.Parse(time.RFC3339, val)
-			if err != nil {
-				parseErrors = append(parseErrors, fmt.Errorf("invalid %s: %w", key, err))
-				return
-			}
-			*t = parsedTime
-		}
-	}
-	parse("contextId", &request.ContextID)
-	parse("status", &request.Status)
-	parse("pageSize", &request.PageSize)
-	parse("pageToken", &request.PageToken)
-	parse("historyLength", &request.HistoryLength)
-	parse("statusTimestampAfter", &request.StatusTimestampAfter)
-	parse("includeArtifacts", &request.IncludeArtifacts)
-	fillTenant(ctx, &request.Tenant)
-	if len(parseErrors) > 0 {
+
+	pageSize, err := parseInt(query, "pageSize")
+	if err != nil {
 		writeRESTError(ctx, rw, a2a.ErrInvalidRequest, a2a.TaskID(""))
 		return
 	}
+
+	includeArtifacts, err := parseBool(query, "includeArtifacts")
+	if err != nil {
+		writeRESTError(ctx, rw, a2a.ErrInvalidRequest, a2a.TaskID(""))
+		return
+	}
+
+	historyLength, err := parseIntOpt(query, "historyLength")
+	if err != nil {
+		writeRESTError(ctx, rw, a2a.ErrInvalidRequest, a2a.TaskID(""))
+		return
+	}
+
+	statusTimestampAfter, err := parseTimeOpt(query, "statusTimestampAfter")
+	if err != nil {
+		writeRESTError(ctx, rw, a2a.ErrInvalidRequest, a2a.TaskID(""))
+		return
+	}
+
+	request := &a2a.ListTasksRequest{
+		ContextID:            query.Get("contextId"),
+		Status:               a2a.TaskState(query.Get("status")),
+		PageSize:             pageSize,
+		PageToken:            query.Get("pageToken"),
+		HistoryLength:        historyLength,
+		StatusTimestampAfter: statusTimestampAfter,
+		IncludeArtifacts:     includeArtifacts,
+	}
+	fillTenant(ctx, &request.Tenant)
+
 	result, err := h.handler.ListTasks(ctx, request)
 	if err != nil {
 		writeRESTError(ctx, rw, err, a2a.TaskID(""))
@@ -223,26 +208,42 @@ func (h *restHandler) handleListTasks(rw http.ResponseWriter, req *http.Request)
 	}
 }
 
-func (h *restHandler) handlePOSTTasks(rw http.ResponseWriter, req *http.Request) {
+func (h *restHandler) handleCancelOrSubscribeTask(rw http.ResponseWriter, req *http.Request) {
 	ctx := req.Context()
 	idAndAction := req.PathValue("idAndAction")
 	if idAndAction == "" {
 		writeRESTError(ctx, rw, a2a.ErrInvalidRequest, a2a.TaskID(""))
 		return
 	}
-
 	if before, ok := strings.CutSuffix(idAndAction, ":cancel"); ok {
-		taskID := before
-		h.handleCancelTask(taskID, rw, req)
-	} else if before, ok := strings.CutSuffix(idAndAction, ":subscribe"); ok {
-		taskID := before
-		req2 := &a2a.SubscribeToTaskRequest{ID: a2a.TaskID(taskID)}
-		fillTenant(ctx, &req2.Tenant)
-		h.handleStreamingRequest(h.handler.SubscribeToTask(ctx, req2), rw, req)
-	} else {
+		h.handleCancelTask(before, rw, req)
+		return
+	}
+	if before, ok := strings.CutSuffix(idAndAction, ":subscribe"); ok {
+		h.handleSubscribeToTask(before, rw, req)
+		return
+	}
+	writeRESTError(ctx, rw, a2a.ErrInvalidRequest, a2a.TaskID(""))
+}
+
+func (h *restHandler) handleGetOrSubscribeTask(rw http.ResponseWriter, req *http.Request) {
+	idAndAction := req.PathValue("idAndAction")
+	if before, ok := strings.CutSuffix(idAndAction, ":subscribe"); ok {
+		h.handleSubscribeToTask(before, rw, req)
+		return
+	}
+	h.handleGetTask(idAndAction, rw, req)
+}
+
+func (h *restHandler) handleSubscribeToTask(taskID string, rw http.ResponseWriter, req *http.Request) {
+	ctx := req.Context()
+	if taskID == "" {
 		writeRESTError(ctx, rw, a2a.ErrInvalidRequest, a2a.TaskID(""))
 		return
 	}
+	subReq := &a2a.SubscribeToTaskRequest{ID: a2a.TaskID(taskID)}
+	fillTenant(ctx, &subReq.Tenant)
+	h.handleStreamingRequest(h.handler.SubscribeToTask(ctx, subReq), rw, req)
 }
 
 func (h *restHandler) handleCancelTask(taskID string, rw http.ResponseWriter, req *http.Request) {
@@ -275,7 +276,7 @@ func (h *restHandler) handleStreamingRequest(eventSequence iter.Seq2[a2a.Event, 
 	}
 	sseWriter.WriteHeaders()
 
-	sseChan, panicChan := make(chan []byte), make(chan error)
+	sseChan, panicChan := make(chan []byte), make(chan error, 1)
 	requestCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -375,7 +376,7 @@ func (h *restHandler) handleCreateTaskPushConfig(rw http.ResponseWriter, req *ht
 		return
 	}
 
-	request := &a2a.CreateTaskPushConfigRequest{}
+	request := &a2a.PushConfig{}
 	if err := json.NewDecoder(req.Body).Decode(request); err != nil {
 		writeRESTError(ctx, rw, a2a.ErrParseError, a2a.TaskID(taskID))
 		return
@@ -515,4 +516,52 @@ func tenantFromContext(ctx context.Context) string {
 		return tenant
 	}
 	return ""
+}
+
+func parseIntOpt(query url.Values, key string) (*int, error) {
+	val := query.Get(key)
+	if val == "" {
+		return nil, nil
+	}
+	v, err := strconv.Atoi(val)
+	if err != nil {
+		return nil, fmt.Errorf("invalid %s: %w", key, err)
+	}
+	return &v, nil
+}
+
+func parseTimeOpt(query url.Values, key string) (*time.Time, error) {
+	val := query.Get(key)
+	if val == "" {
+		return nil, nil
+	}
+	parsedTime, err := time.Parse(time.RFC3339, val)
+	if err != nil {
+		return nil, fmt.Errorf("invalid %s: %w", key, err)
+	}
+	return &parsedTime, nil
+}
+
+func parseInt(query url.Values, key string) (int, error) {
+	val := query.Get(key)
+	if val == "" {
+		return 0, nil
+	}
+	v, err := strconv.Atoi(val)
+	if err != nil {
+		return 0, fmt.Errorf("invalid %s: %w", key, err)
+	}
+	return v, nil
+}
+
+func parseBool(query url.Values, key string) (bool, error) {
+	val := query.Get(key)
+	if val == "" {
+		return false, nil
+	}
+	v, err := strconv.ParseBool(val)
+	if err != nil {
+		return false, fmt.Errorf("invalid %s: %w", key, err)
+	}
+	return v, nil
 }

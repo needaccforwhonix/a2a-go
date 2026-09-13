@@ -18,6 +18,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"time"
 
 	"github.com/a2aproject/a2a-go/v2/a2a"
 	"github.com/a2aproject/a2a-go/v2/a2asrv/eventqueue"
@@ -28,30 +29,48 @@ import (
 )
 
 type workQueueHandler struct {
-	queueManager eventqueue.Manager
-	taskStore    taskstore.Store
-	factory      Factory
-	panicHandler PanicHandlerFn
+	queueManager      eventqueue.Manager
+	taskStore         taskstore.Store
+	factory           Factory
+	panicHandler      PanicHandlerFn
+	inactivityTimeout time.Duration
 }
 
 func newWorkQueueHandler(cfg DistributedManagerConfig) *workQueueHandler {
 	backend := &workQueueHandler{
-		queueManager: cfg.QueueManager,
-		taskStore:    cfg.TaskStore,
-		factory:      cfg.Factory,
-		panicHandler: cfg.PanicHandler,
+		queueManager:      cfg.QueueManager,
+		taskStore:         cfg.TaskStore,
+		factory:           cfg.Factory,
+		panicHandler:      cfg.PanicHandler,
+		inactivityTimeout: cfg.AgentInactivityTimeout,
 	}
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
 	}
+
 	cfg.WorkQueue.RegisterHandler(workqueue.HandlerConfig{
 		Limiter: cfg.ConcurrencyConfig,
 	}, func(ctx context.Context, p *workqueue.Payload) (a2a.SendMessageResult, error) {
-		logger := cfg.Logger.WithGroup("a2a").With(
+		attrs := []any{
 			slog.String("task_id", string(p.TaskID)),
 			slog.String("work_type", string(p.Type)),
-		)
-		return backend.handle(log.AttachLogger(ctx, logger), p)
+		}
+
+		if p.ExecuteRequest != nil && p.ExecuteRequest.Message != nil {
+			attrs = append(attrs, slog.String("message_id", p.ExecuteRequest.Message.ID))
+		}
+
+		if cfg.ContextCodec != nil && p.CallContext != nil {
+			localCtx, err := cfg.ContextCodec.Decode(ctx, p.CallContext)
+			if err != nil {
+				return nil, fmt.Errorf("context decoding failed: %w", err)
+			}
+			ctx = localCtx
+		}
+
+		ctx = log.AttachLogger(ctx, cfg.Logger.WithGroup("a2a").With(attrs...))
+
+		return backend.handle(ctx, p)
 	})
 	return backend
 }
@@ -59,6 +78,9 @@ func newWorkQueueHandler(cfg DistributedManagerConfig) *workQueueHandler {
 func (b *workQueueHandler) handle(ctx context.Context, payload *workqueue.Payload) (a2a.SendMessageResult, error) {
 	pipe := eventpipe.NewLocal()
 	defer pipe.Close()
+
+	tracker := newInactivityTracker(b.inactivityTimeout)
+	producerWriter := newActivityTrackingWriter(pipe.Writer, tracker)
 
 	var eventProducer eventProducerFn
 	var eventProcessor Processor
@@ -73,7 +95,7 @@ func (b *workQueueHandler) handle(ctx context.Context, payload *workqueue.Payloa
 		if err != nil {
 			return nil, fmt.Errorf("executor setup failed: %w", err)
 		}
-		eventProducer = func(ctx context.Context) error { return executor.Execute(ctx, pipe.Writer) }
+		eventProducer = func(ctx context.Context) error { return executor.Execute(ctx, producerWriter) }
 		eventProcessor = processor
 		cleaner = localCleaner
 
@@ -85,7 +107,7 @@ func (b *workQueueHandler) handle(ctx context.Context, payload *workqueue.Payloa
 		if err != nil {
 			return nil, fmt.Errorf("canceler setup failed: %w", err)
 		}
-		eventProducer = func(ctx context.Context) error { return canceler.Cancel(ctx, pipe.Writer) }
+		eventProducer = func(ctx context.Context) error { return canceler.Cancel(ctx, producerWriter) }
 		eventProcessor = processor
 		cleaner = localCleaner
 
@@ -117,7 +139,7 @@ func (b *workQueueHandler) handle(ctx context.Context, payload *workqueue.Payloa
 		heartbeater = hb
 	}
 
-	result, err := runProducerConsumer(ctx, eventProducer, handler.processEvents, heartbeater, b.panicHandler)
+	result, err := runProducerConsumer(ctx, eventProducer, handler.processEvents, heartbeater, b.panicHandler, tracker)
 	cleaner.Cleanup(ctx, result, err)
 	return result, err
 }

@@ -77,3 +77,14 @@ func (sp *ServiceParams) With(additional map[string][]string) *ServiceParams {
 	}
 	return &ServiceParams{kv: merged}
 }
+
+func (sp *ServiceParams) cloneRaw() map[string][]string {
+	if sp == nil {
+		return nil
+	}
+	res := make(map[string][]string, len(sp.kv))
+	for k, v := range sp.kv {
+		res[k] = slices.Clone(v)
+	}
+	return res
+}

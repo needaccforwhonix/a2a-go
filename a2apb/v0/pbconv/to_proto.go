@@ -15,6 +15,7 @@
 package pbconv
 
 import (
+	"encoding/base64"
 	"fmt"
 	"maps"
 	"slices"
@@ -134,20 +135,20 @@ func ToProtoTaskSubscriptionRequest(req *a2a.SubscribeToTaskRequest) (*a2apb.Tas
 	return &a2apb.TaskSubscriptionRequest{Name: MakeTaskName(req.ID)}, nil
 }
 
-// ToProtoCreateTaskPushConfigRequest converts a [a2a.CreateTaskPushConfigRequest] to a [a2apb.CreateTaskPushNotificationConfigRequest].
-func ToProtoCreateTaskPushConfigRequest(req *a2a.CreateTaskPushConfigRequest) (*a2apb.CreateTaskPushNotificationConfigRequest, error) {
+// ToProtoCreateTaskPushConfigRequest converts a [a2a.TaskPushConfig] to a [a2apb.CreateTaskPushNotificationConfigRequest].
+func ToProtoCreateTaskPushConfigRequest(req *a2a.PushConfig) (*a2apb.CreateTaskPushNotificationConfigRequest, error) {
 	if req == nil {
 		return nil, nil
 	}
 
-	pnc, err := toProtoPushConfig(&req.Config)
+	pnc, err := toProtoPushConfig(req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to convert push config: %w", err)
 	}
 
 	return &a2apb.CreateTaskPushNotificationConfigRequest{
 		Parent:   MakeTaskName(req.TaskID),
-		ConfigId: req.Config.ID,
+		ConfigId: req.ID,
 		Config:   &a2apb.TaskPushNotificationConfig{PushNotificationConfig: pnc},
 	}, nil
 }
@@ -302,11 +303,13 @@ func toProtoFilePart(part *a2a.Part) (*a2apb.Part, error) {
 	}
 	switch fc := part.Content.(type) {
 	case a2a.Raw:
+		buf := make([]byte, base64.StdEncoding.EncodedLen(len(fc)))
+		base64.StdEncoding.Encode(buf, []byte(fc))
 		return &a2apb.Part{
 			Part: &a2apb.Part_File{File: &a2apb.FilePart{
 				MimeType: part.MediaType,
 				Name:     part.Filename,
-				File:     &a2apb.FilePart_FileWithBytes{FileWithBytes: fc},
+				File:     &a2apb.FilePart_FileWithBytes{FileWithBytes: buf},
 			}},
 			Metadata: meta,
 		}, nil
@@ -561,8 +564,8 @@ func ToProtoListTasksResponse(response *a2a.ListTasksResponse) (*a2apb.ListTasks
 	return result, nil
 }
 
-// ToProtoTaskPushConfig converts a [a2a.TaskPushConfig] to a [a2apb.TaskPushNotificationConfig].
-func ToProtoTaskPushConfig(config *a2a.TaskPushConfig) (*a2apb.TaskPushNotificationConfig, error) {
+// ToProtoTaskPushConfig converts a [a2a.PushConfig] to a [a2apb.TaskPushNotificationConfig].
+func ToProtoTaskPushConfig(config *a2a.PushConfig) (*a2apb.TaskPushNotificationConfig, error) {
 	if config == nil {
 		return nil, nil
 	}
@@ -571,7 +574,7 @@ func ToProtoTaskPushConfig(config *a2a.TaskPushConfig) (*a2apb.TaskPushNotificat
 		return nil, fmt.Errorf("taskID is required on TaskPushConfig")
 	}
 
-	pConfig, err := toProtoPushConfig(&config.Config)
+	pConfig, err := toProtoPushConfig(config)
 	if err != nil {
 		return nil, err
 	}

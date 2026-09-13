@@ -49,7 +49,7 @@ func TestInMemoryManager(t *testing.T) {
 		t.Fatalf("reader.Read() error = %v", err)
 	}
 	if diff := cmp.Diff(wantEvent, got.Event); diff != "" {
-		t.Fatalf("reader.Read() wrong result (+got,-want) diff = %s", diff)
+		t.Fatalf("reader.Read() wrong result (-want +got) diff = %s", diff)
 	}
 	<-doneChan
 	if err := manager.Destroy(ctx, tid); err != nil {
@@ -73,7 +73,7 @@ func TestInMemoryManager_ConcurrentCreation(t *testing.T) {
 	numGoroutines, numTaskIDs := 100, 10
 
 	created := make(chan taskQueue, numGoroutines)
-	for i := 0; i < numGoroutines; i++ {
+	for i := range numGoroutines {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
@@ -112,7 +112,7 @@ func TestInMemoryManager_ConcurrentCreation(t *testing.T) {
 				t.Fatalf("readQueue.Read() error = %v", err)
 			}
 			if diff := cmp.Diff(want, got.Event); diff != "" {
-				t.Fatalf("readQueue.Read() wrong result (+got,-want) diff = %s", diff)
+				t.Fatalf("readQueue.Read() wrong result (-want +got) diff = %s", diff)
 			}
 		}
 	}

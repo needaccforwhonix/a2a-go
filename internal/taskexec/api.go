@@ -16,12 +16,19 @@ package taskexec
 
 import (
 	"context"
+	"errors"
 	"iter"
 
 	"github.com/a2aproject/a2a-go/v2/a2a"
 	"github.com/a2aproject/a2a-go/v2/a2asrv/taskstore"
 	"github.com/a2aproject/a2a-go/v2/internal/eventpipe"
 )
+
+// ErrAgentInactivityTimeout is the cancellation cause set on the producer
+// context when an agent fails to write any events to the event pipe within
+// the configured inactivity timeout window. Callers can check for this
+// condition with errors.Is.
+var ErrAgentInactivityTimeout = errors.New("agent inactivity timeout")
 
 // Manager provides an API for executing and canceling tasks.
 type Manager interface {
@@ -98,3 +105,11 @@ type Cleaner interface {
 
 // PanicHandlerFn is a function that handles panics occurred during execution.
 type PanicHandlerFn func(r any) error
+
+// ContextCodec is used to propagate context information between processes.
+type ContextCodec interface {
+	// Encode encodes context information which will propagate through the work queue.
+	Encode(context.Context) (map[string]any, error)
+	// Decode is used to restore context which then gets passed to an agent execution.
+	Decode(context.Context, map[string]any) (context.Context, error)
+}
