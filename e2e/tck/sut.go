@@ -92,7 +92,6 @@ func main() {
 	if err := group.Wait(); err != nil {
 		log.Fatalf("Server shutdown: %v", err)
 	}
-
 }
 
 func newAgentCard(cardURL string, preferredTransport a2a.TransportProtocol) *a2a.AgentCard {
@@ -103,8 +102,8 @@ func newAgentCard(cardURL string, preferredTransport a2a.TransportProtocol) *a2a
 			a2a.NewAgentInterface(cardURL, preferredTransport),
 		},
 		Version:            "1.0.0",
-		DefaultInputModes:  []string{"text"},
-		DefaultOutputModes: []string{"text"},
+		DefaultInputModes:  []string{"text/plain"},
+		DefaultOutputModes: []string{"text/plain"},
 		Capabilities: a2a.AgentCapabilities{
 			Streaming:         true,
 			ExtendedAgentCard: true,
